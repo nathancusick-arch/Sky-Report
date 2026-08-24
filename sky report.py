@@ -1,4 +1,5 @@
 import io
+import hashlib
 import json
 import os
 import re
@@ -696,6 +697,63 @@ def show_outlook_copy_button(plain_text, html_text):
     )
 
 
+def uploaded_files_signature(files):
+    signature = []
+    for uploaded in files:
+        data = uploaded.getvalue()
+        signature.append((uploaded.name, len(data), hashlib.sha256(data).hexdigest()))
+    return tuple(signature)
+
+
+def display_generation_result(saved_result):
+    if saved_result["status"] == "missing_lookup":
+        missing = saved_result["missing"]
+        st.error(
+            f"Generation stopped because {len(missing):,} audit(s) could not be matched to all required lookup data. "
+            "Check the combined account reference and Sky sites export, or review the diagnostic CSV below."
+        )
+        st.dataframe(missing.head(100), use_container_width=True, hide_index=True)
+        st.download_button(
+            "Download missing lookup diagnostic",
+            missing.to_csv(index=False).encode("utf-8-sig"),
+            "Sky Missing Lookup Values.csv",
+            "text/csv",
+            key="download_missing_lookup",
+        )
+        return
+
+    row_count = saved_result["row_count"]
+    duplicate_count = saved_result["duplicate_count"]
+    st.success(
+        f"Generated one combined LIVE report containing {row_count:,} row(s)."
+        + (f" Excluded {duplicate_count:,} audit(s) already in the LIVE history." if duplicate_count else "")
+    )
+    st.download_button(
+        "Download Sky LIVE report",
+        saved_result["live_output"],
+        saved_result["live_name"],
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="download_live_report",
+    )
+    st.subheader("Email text")
+    st.caption(
+        "Use the button to copy a formatted bullet list into a new Outlook email. "
+        "The plain-text version below also has a copy icon."
+    )
+    show_outlook_copy_button(saved_result["email_text"], saved_result["email_html"])
+    st.code(saved_result["email_text"], language=None)
+    with st.expander("Reference-file diagnostics"):
+        recognised = saved_result["recognised"]
+        ignored = saved_result["ignored"]
+        if recognised:
+            for label, fields in recognised:
+                st.write(f"✓ {label}: {', '.join(fields)}")
+        else:
+            st.write("No uploaded reference table was recognised.")
+        for item in ignored:
+            st.write(f"Not recognised: {item}")
+
+
 def report_basename(records):
     dates = sorted({record["visit_date"] for record in records if record["visit_date"]})
     if not dates:
@@ -1200,6 +1258,15 @@ if export_file is not None:
         export_df = None
 
 ready = all([export_file, live_file, sites_file, reference_file])
+result_key = "sky_report_generation"
+current_signature = uploaded_files_signature(
+    [export_file, live_file, sites_file, reference_file]
+) if ready else None
+saved_result = st.session_state.get(result_key)
+if saved_result is not None and saved_result.get("input_signature") != current_signature:
+    del st.session_state[result_key]
+    saved_result = None
+
 if st.button("Generate Sky LIVE report", type="primary", disabled=not ready):
     if export_df is None:
         st.error("Please correct the audit export first.")
@@ -1216,44 +1283,31 @@ if st.button("Generate Sky LIVE report", type="primary", disabled=not ready):
                 )
             live_output, records, duplicate_count, missing, recognised, ignored = result
             if live_output is None:
-                st.error(
-                    f"Generation stopped because {len(missing):,} audit(s) could not be matched to all required lookup data. "
-                    "Check the combined account reference and Sky sites export, or review the diagnostic CSV below."
-                )
-                st.dataframe(missing.head(100), use_container_width=True, hide_index=True)
-                st.download_button(
-                    "Download missing lookup diagnostic",
-                    missing.to_csv(index=False).encode("utf-8-sig"),
-                    "Sky Missing Lookup Values.csv",
-                    "text/csv",
-                )
+                st.session_state[result_key] = {
+                    "status": "missing_lookup",
+                    "input_signature": current_signature,
+                    "missing": missing,
+                }
             else:
                 live_name = f"{report_basename(records)} LIVE.xlsx"
-                st.success(
-                    f"Generated one combined LIVE report containing {len(records):,} row(s)."
-                    + (f" Excluded {duplicate_count:,} audit(s) already in the LIVE history." if duplicate_count else "")
-                )
-                st.download_button(
-                    "Download Sky LIVE report",
-                    live_output,
-                    live_name,
-                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
                 email_text, email_html = build_email_content(records)
-                st.subheader("Email text")
-                st.caption(
-                    "Use the button to copy a formatted bullet list into a new Outlook email. "
-                    "The plain-text version below also has a copy icon."
-                )
-                show_outlook_copy_button(email_text, email_html)
-                st.code(email_text, language=None)
-                with st.expander("Reference-file diagnostics"):
-                    if recognised:
-                        for label, fields in recognised:
-                            st.write(f"✓ {label}: {', '.join(fields)}")
-                    else:
-                        st.write("No uploaded reference table was recognised.")
-                    for item in ignored:
-                        st.write(f"Not recognised: {item}")
+                st.session_state[result_key] = {
+                    "status": "success",
+                    "input_signature": current_signature,
+                    "live_output": live_output,
+                    "live_name": live_name,
+                    "row_count": len(records),
+                    "duplicate_count": duplicate_count,
+                    "email_text": email_text,
+                    "email_html": email_html,
+                    "recognised": recognised,
+                    "ignored": ignored,
+                }
+            saved_result = st.session_state[result_key]
         except Exception as exc:
+            st.session_state.pop(result_key, None)
+            saved_result = None
             st.exception(exc)
+
+if saved_result is not None:
+    display_generation_result(saved_result)
