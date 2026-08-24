@@ -104,7 +104,8 @@ LOOKUP_FIELDS = [
     "city", "region", "territory", "record_id",
     "sky_reference_number", "premise_id", "pot",
 ]
-CRITICAL_LOOKUP_FIELDS = ["city", "region", "territory", "pot"]
+CRITICAL_LOOKUP_FIELDS = ["city"]
+OPTIONAL_LOOKUP_FIELDS = ["region", "territory", "pot"]
 
 
 def clean_text(value):
@@ -916,7 +917,7 @@ def rebuild_package(template_bytes, replacements, active_tab):
     return output.getvalue()
 
 
-def generate_report(export_df, live_template, reference_files, uk_order, ireland_order, allow_incomplete):
+def generate_report(export_df, live_template, reference_files, uk_order, ireland_order):
     live_paths = verify_template(
         live_template,
         [MACROS_SHEET, RAW_SHEET, TOTAL_SHEET, SUMMARY_SHEET, COMCAST_SHEET, POSTCODES_SHEET],
@@ -932,7 +933,7 @@ def generate_report(export_df, live_template, reference_files, uk_order, ireland
     unassigned = sorted(record_orders - assigned)
     if unassigned:
         raise ValueError(f"The following order ID(s) have not been assigned to a market: {', '.join(map(str, unassigned))}")
-    if not missing.empty and not allow_incomplete:
+    if not missing.empty:
         return None, records, duplicate_count, missing, recognised, ignored
 
     with zipfile.ZipFile(io.BytesIO(live_template), "r") as zf:
@@ -970,12 +971,13 @@ with right:
         help="The sites export must contain internal_id and city columns.",
     )
     reference_files = st.file_uploader(
-        "4. Latest Sky account reference files",
+        "4. Latest Sky account reference files (optional)",
         type=["csv", "xlsx", "xlsm"],
         accept_multiple_files=True,
         help=(
-            "Upload the latest Sky UK and Ireland lists used for Region, Territory, Record ID, "
-            "Sky Reference Number, Premise ID and Pot."
+            "If these become available, upload the latest Sky UK and Ireland lists used for Region, "
+            "Territory, Record ID, Sky Reference Number, Premise ID and Pot. Without them, the app "
+            "uses values already held in the previous LIVE report and leaves unavailable values blank."
         ),
     )
 
@@ -995,12 +997,6 @@ if export_file is not None:
         st.error(str(exc))
         export_df = None
 
-allow_incomplete = st.checkbox(
-    "Allow the LIVE report to be generated with missing City/Region/Territory/Pot values",
-    value=False,
-    help="Leave this off for normal reporting. It is only intended for investigating an incomplete reference file.",
-)
-
 ready = all([export_file, live_file, sites_file])
 if st.button("Generate Sky LIVE report", type="primary", disabled=not ready):
     if export_df is None:
@@ -1015,13 +1011,12 @@ if st.button("Generate Sky LIVE report", type="primary", disabled=not ready):
                     lookup_files,
                     uk_order,
                     ireland_order,
-                    allow_incomplete,
                 )
             live_output, records, duplicate_count, missing, recognised, ignored = result
             if live_output is None:
                 st.error(
-                    f"Generation stopped because {len(missing):,} audit(s) are missing required lookup values. "
-                    "Upload the latest Sky account reference files, or review the diagnostic CSV below."
+                    f"Generation stopped because {len(missing):,} audit(s) could not be matched to a City. "
+                    "Check the Sky sites export, or review the diagnostic CSV below."
                 )
                 st.dataframe(missing.head(100), use_container_width=True, hide_index=True)
                 st.download_button(
@@ -1042,8 +1037,16 @@ if st.button("Generate Sky LIVE report", type="primary", disabled=not ready):
                     live_name,
                     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
-                if not missing.empty:
-                    st.warning(f"Generated with {len(missing):,} incomplete lookup row(s) because the override was selected.")
+                optional_gap_count = sum(
+                    any(not useful(record.get(field)) for field in OPTIONAL_LOOKUP_FIELDS)
+                    for record in records
+                )
+                if optional_gap_count:
+                    st.info(
+                        f"{optional_gap_count:,} row(s) do not have every optional Region, Territory or Pot value. "
+                        "The report was generated normally; historic values were used where available and the "
+                        "remaining cells were left blank."
+                    )
                 with st.expander("Reference-file diagnostics"):
                     if recognised:
                         for label, fields in recognised:
