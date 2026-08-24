@@ -454,9 +454,6 @@ def combine_lookup(row, support, references):
     for field, value in account_reference.items():
         if useful(value):
             result[field] = value
-        elif field in {"sky_reference_number", "premise_id"}:
-            # Excel's original XLOOKUP workflow returns 0 for blank numeric IDs.
-            result[field] = 0
         else:
             result[field] = None
     result["account_id"] = smart_value(row.get("site_code"))
@@ -492,7 +489,7 @@ def build_records(df, support, references):
             "postcode": smart_value(row["site_post_code"]),
             "submitted": parse_date(row["submitted_date"], "submitted_date"),
             "approved": parse_date(row["approval_date"], "approval_date"),
-            "approver": smart_value(row["approved_by_name"]),
+            "approver": None,
             "item": smart_value(row["item_to_order"]),
             "visit_date": parse_date(row["date_of_visit_local"], "date_of_visit_local"),
             "visit_time": parse_time(row["time_of_visit_local"]),
@@ -502,9 +499,9 @@ def build_records(df, support, references):
             "region": lookup.get("region"),
             "territory": lookup.get("territory"),
             "account_id": lookup.get("account_id"),
-            "record_id": lookup.get("record_id"),
-            "sky_reference_number": lookup.get("sky_reference_number", 0),
-            "premise_id": lookup.get("premise_id", 0),
+            "record_id": None,
+            "sky_reference_number": lookup.get("sky_reference_number"),
+            "premise_id": lookup.get("premise_id"),
             "pot": lookup.get("pot"),
             "questions": questions,
         }
@@ -675,7 +672,7 @@ def total_values(record):
 
 def raw_values(record):
     return [
-        None, record["approver"], record["order"], record["client"], record["audit"], record["site"],
+        None, None, record["order"], record["client"], record["audit"], record["site"],
         record["end_date"], record["responsibility"], record["name"], record["address1"],
         record["address2"], record["address3"], record["city"], record["postcode"], record["submitted"],
         record["approved"], record["item"], record["visit_date"], record["visit_time"], None,
@@ -711,6 +708,7 @@ def set_or_create_cell(row, col, row_number, value=None, formula=None, cached=No
         v.text = "" if cached is None else number_text(cached)
     elif value is None or value == "":
         row.remove(cell)
+        sort_row_cells(row)
         return
     elif isinstance(value, bool):
         cell.set("t", "b")
@@ -725,6 +723,27 @@ def set_or_create_cell(row, col, row_number, value=None, formula=None, cached=No
         if safe != safe.strip():
             text.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
         text.text = safe
+    sort_row_cells(row)
+
+
+def sort_row_cells(row):
+    cells = list(row.findall(Q("c")))
+    if len(cells) < 2:
+        return
+    for cell in cells:
+        row.remove(cell)
+    cells.sort(
+        key=lambda cell: (
+            sum(
+                (ord(char) - ord("A") + 1) * (26 ** power)
+                for power, char in enumerate(
+                    reversed(re.match(r"[A-Z]+", cell.get("r", "A")).group(0))
+                )
+            )
+        )
+    )
+    for cell in cells:
+        row.append(cell)
 
 
 def replace_data_rows(xml_bytes, start_row, row_xml_strings, end_col):
@@ -852,20 +871,50 @@ def update_summary_xml(xml_bytes, records, uk_order, ireland_order, support, for
     return etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
 
 
+def find_separator_row_template(xml_bytes):
+    candidates = re.finditer(rb'<row\b[^>]*>.*?</row>', xml_bytes, flags=re.DOTALL)
+    result = None
+    for match in candidates:
+        row_xml = match.group(0)
+        if (
+            b'customFormat="1"' in row_xml
+            and b"<v>" not in row_xml
+            and b"<is>" not in row_xml
+            and b"<f" not in row_xml
+        ):
+            result = row_xml
+    if result is None:
+        raise ValueError("Could not locate the yellow separator-row style in the historical data sheet.")
+    return result
+
+
+def renumber_row_xml(row_xml, row_number):
+    def replace_ref(match):
+        column = match.group(1) or b""
+        return b'r="' + column + str(row_number).encode() + b'"'
+    return re.sub(rb'r="([A-Z]+)?\d+"', replace_ref, row_xml)
+
+
 def update_total_xml(xml_bytes, records, first_row):
     if not records:
         return xml_bytes
     styles = row_styles_from_xml(xml_bytes, 3)
+    separator_template = find_separator_row_template(xml_bytes)
+    separator_rows = [
+        renumber_row_xml(separator_template, first_row + offset)
+        for offset in range(3)
+    ]
+    data_first_row = first_row + 3
     appended = []
     for offset, record in enumerate(records):
-        appended.append(make_row_xml(first_row + offset, total_values(record), styles, max_col=75))
+        appended.append(make_row_xml(data_first_row + offset, total_values(record), styles, max_col=75))
     marker = b"</sheetData>"
     position = xml_bytes.find(marker)
     if position < 0:
         raise ValueError("Could not locate sheetData in the historical data sheet.")
-    insertion = "".join(appended).encode("utf-8")
+    insertion = b"".join(separator_rows) + "".join(appended).encode("utf-8")
     updated = xml_bytes[:position] + insertion + xml_bytes[position:]
-    new_last = first_row + len(records) - 1
+    new_last = data_first_row + len(records) - 1
     updated = re.sub(
         rb'(<dimension\b[^>]*\bref=")[^"]+("[^>]*/?>)',
         lambda m: m.group(1) + f"A1:BW{new_last}".encode() + m.group(2),
@@ -875,7 +924,7 @@ def update_total_xml(xml_bytes, records, first_row):
     return updated
 
 
-def clean_workbook_xml(xml_bytes, active_tab):
+def clean_workbook_xml(xml_bytes, active_tab, record_count):
     root = etree.fromstring(xml_bytes)
     external_refs = root.find(Q("externalReferences"))
     if external_refs is not None:
@@ -889,6 +938,18 @@ def clean_workbook_xml(xml_bytes, active_tab):
     book_views = root.find(Q("bookViews"))
     if book_views is not None and len(book_views):
         book_views[0].set("activeTab", str(active_tab))
+    defined_names = root.find(Q("definedNames"))
+    if defined_names is not None:
+        for defined_name in list(defined_names):
+            formula = defined_name.text or ""
+            if "[" in formula or "#REF!" in formula:
+                defined_names.remove(defined_name)
+                continue
+            if defined_name.get("name") == "_xlnm._FilterDatabase":
+                if formula.startswith(f"'{RAW_SHEET}'!"):
+                    defined_name.text = f"'{RAW_SHEET}'!$A$2:$CO${record_count + 2}"
+                elif formula.startswith(f"{SUMMARY_SHEET}!"):
+                    defined_name.text = f"{SUMMARY_SHEET}!$A$11:$AY${record_count + 11}"
     return etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
 
 
@@ -914,7 +975,7 @@ def remove_external_formulas(xml_bytes):
     return re.sub(rb'<f(?:\s[^>]*)?>[^<]*\[[^<]*</f>', b"", xml_bytes)
 
 
-def rebuild_package(template_bytes, replacements, active_tab):
+def rebuild_package(template_bytes, replacements, active_tab, record_count):
     source = io.BytesIO(template_bytes)
     output = io.BytesIO()
     with zipfile.ZipFile(source, "r") as zin, zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED, allowZip64=True) as zout:
@@ -926,7 +987,7 @@ def rebuild_package(template_bytes, replacements, active_tab):
             if name in replacements:
                 data = replacements[name]
             elif name == "xl/workbook.xml":
-                data = clean_workbook_xml(data, active_tab)
+                data = clean_workbook_xml(data, active_tab, record_count)
             elif name == "xl/_rels/workbook.xml.rels":
                 data = clean_workbook_rels(data)
             elif name == "[Content_Types].xml":
@@ -974,6 +1035,7 @@ def generate_report(export_df, live_template, reference_files, uk_order, ireland
         live_template,
         {total_path: total_xml, raw_path: raw_xml, summary_path: summary_xml, macros_path: macros_xml},
         raw_index,
+        len(records),
     )
 
     return live_output, records, duplicate_count, missing, recognised, ignored
