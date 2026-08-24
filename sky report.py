@@ -90,22 +90,22 @@ FIELD_ALIASES = {
     },
     "city": {"city", "town", "sitecity", "sitetown", "towncity"},
     "postcode": {"postcode", "postalcode", "sitepostcode", "eircode"},
-    "region": {"region", "regionnumber", "regionno"},
+    "region": {"region", "newregion", "regionnumber", "regionno"},
     "territory": {"territory", "territorynumber", "territoryno"},
     "record_id": {"recordid", "recordidentifier", "skyrecordid"},
     "sky_reference_number": {
-        "skyreferencenumber", "skyreference", "skyrefno", "skyrefnumber", "skyref"
+        "skyreferencenumber", "skyreference", "skyrefno", "skyrefnumber", "skyref",
+        "ospreyid", "ospreyidentifier",
     },
     "premise_id": {"premiseid", "premisesid", "premiseidnumber", "premisesidentifier"},
-    "pot": {"pot", "potnumber", "potno"},
+    "pot": {"pot", "potid", "potnumber", "potno"},
 }
 
 LOOKUP_FIELDS = [
     "city", "region", "territory", "record_id",
     "sky_reference_number", "premise_id", "pot",
 ]
-CRITICAL_LOOKUP_FIELDS = ["city"]
-OPTIONAL_LOOKUP_FIELDS = ["region", "territory", "pot"]
+CRITICAL_LOOKUP_FIELDS = ["city", "region", "territory", "pot"]
 
 
 def clean_text(value):
@@ -244,13 +244,15 @@ def detect_reference_table(rows):
     return best
 
 
-def merge_lookup(target, key, record):
+def merge_lookup(target, key, record, keep_blank=False):
     if not key:
         return
     existing = target.setdefault(key, {})
     for field, value in record.items():
         if useful(value):
             existing[field] = smart_value(value)
+        elif keep_blank:
+            existing[field] = None
 
 
 def process_reference_rows(rows, source_label, maps, recognised):
@@ -265,7 +267,12 @@ def process_reference_rows(rows, source_label, maps, recognised):
             if col_index < len(row):
                 record[field] = row[col_index]
         merge_lookup(maps["site"], normalise_key(record.get("site_internal_id")), record)
-        merge_lookup(maps["account"], normalise_key(record.get("account_id")), record)
+        # Preserve explicit blanks in the exact Account ID table so the latest
+        # account master remains authoritative over historic LIVE values.
+        merge_lookup(
+            maps["account"], normalise_key(record.get("account_id")), record,
+            keep_blank=True,
+        )
         merge_lookup(maps["postcode"], normalise_postcode_key(record.get("postcode")), record)
 
 
@@ -441,9 +448,17 @@ def combine_lookup(row, support, references):
         support["history_account"].get(account_key, {}),
         references["postcode"].get(postcode_key, {}),
         references["site"].get(site_key, {}),
-        references["account"].get(account_key, {}),
     ):
         update_record(result, source)
+    account_reference = references["account"].get(account_key, {})
+    for field, value in account_reference.items():
+        if useful(value):
+            result[field] = value
+        elif field in {"sky_reference_number", "premise_id"}:
+            # Excel's original XLOOKUP workflow returns 0 for blank numeric IDs.
+            result[field] = 0
+        else:
+            result[field] = None
     result["account_id"] = smart_value(row.get("site_code"))
     return result
 
@@ -458,6 +473,9 @@ def build_records(df, support, references):
             duplicate_count += 1
             continue
         lookup = combine_lookup(row, support, references)
+        account_reference_match = bool(
+            references["account"].get(normalise_key(row.get("site_code")))
+        )
         questions = [smart_value(row.get(question)) for question in QUESTION_COLUMNS]
         record = {
             "order": smart_value(row["order_internal_id"]),
@@ -491,6 +509,8 @@ def build_records(df, support, references):
             "questions": questions,
         }
         missing = [field for field in CRITICAL_LOOKUP_FIELDS if not useful(record.get(field))]
+        if not account_reference_match:
+            missing.insert(0, "account reference match")
         if missing:
             missing_rows.append({
                 "internal_id": record["audit"], "site_internal_id": record["site"],
@@ -925,6 +945,11 @@ def generate_report(export_df, live_template, reference_files, uk_order, ireland
     )
     support = read_live_support(live_template)
     references, recognised, ignored = read_reference_files(reference_files)
+    if not references["account"]:
+        raise ValueError(
+            "The combined Sky account reference file was not recognised. Upload the latest "
+            "workbook containing Account ID, NewRegion, Territory and Pot ID columns."
+        )
     records, duplicate_count, missing = build_records(export_df, support, references)
     if not records:
         raise ValueError("Every audit in the export is already present in the previous LIVE report.")
@@ -970,14 +995,12 @@ with right:
         type=["csv"],
         help="The sites export must contain internal_id and city columns.",
     )
-    reference_files = st.file_uploader(
-        "4. Latest Sky account reference files (optional)",
-        type=["csv", "xlsx", "xlsm"],
-        accept_multiple_files=True,
+    reference_file = st.file_uploader(
+        "4. Latest Serve Legal UK/ROI combined account reference",
+        type=["xlsx", "xlsm"],
         help=(
-            "If these become available, upload the latest Sky UK and Ireland lists used for Region, "
-            "Territory, Record ID, Sky Reference Number, Premise ID and Pot. Without them, the app "
-            "uses values already held in the previous LIVE report and leaves unavailable values blank."
+            "Upload the latest combined workbook with Account ID, OspreyId, PremiseId, "
+            "NewRegion, Territory and Pot ID columns."
         ),
     )
 
@@ -997,13 +1020,13 @@ if export_file is not None:
         st.error(str(exc))
         export_df = None
 
-ready = all([export_file, live_file, sites_file])
+ready = all([export_file, live_file, sites_file, reference_file])
 if st.button("Generate Sky LIVE report", type="primary", disabled=not ready):
     if export_df is None:
         st.error("Please correct the audit export first.")
     else:
         try:
-            lookup_files = list(reference_files or []) + [sites_file]
+            lookup_files = [reference_file, sites_file]
             with st.spinner("Building and validating the combined Sky LIVE report…"):
                 result = generate_report(
                     export_df,
@@ -1015,8 +1038,8 @@ if st.button("Generate Sky LIVE report", type="primary", disabled=not ready):
             live_output, records, duplicate_count, missing, recognised, ignored = result
             if live_output is None:
                 st.error(
-                    f"Generation stopped because {len(missing):,} audit(s) could not be matched to a City. "
-                    "Check the Sky sites export, or review the diagnostic CSV below."
+                    f"Generation stopped because {len(missing):,} audit(s) could not be matched to all required lookup data. "
+                    "Check the combined account reference and Sky sites export, or review the diagnostic CSV below."
                 )
                 st.dataframe(missing.head(100), use_container_width=True, hide_index=True)
                 st.download_button(
@@ -1037,22 +1060,12 @@ if st.button("Generate Sky LIVE report", type="primary", disabled=not ready):
                     live_name,
                     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
-                optional_gap_count = sum(
-                    any(not useful(record.get(field)) for field in OPTIONAL_LOOKUP_FIELDS)
-                    for record in records
-                )
-                if optional_gap_count:
-                    st.info(
-                        f"{optional_gap_count:,} row(s) do not have every optional Region, Territory or Pot value. "
-                        "The report was generated normally; historic values were used where available and the "
-                        "remaining cells were left blank."
-                    )
                 with st.expander("Reference-file diagnostics"):
                     if recognised:
                         for label, fields in recognised:
                             st.write(f"✓ {label}: {', '.join(fields)}")
                     else:
-                        st.write("No uploaded reference table was recognised; only historic LIVE data was available.")
+                        st.write("No uploaded reference table was recognised.")
                     for item in ignored:
                         st.write(f"Not recognised: {item}")
         except Exception as exc:
