@@ -1,4 +1,5 @@
 import io
+import json
 import os
 import re
 import zipfile
@@ -8,6 +9,7 @@ from xml.sax.saxutils import escape
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 from lxml import etree
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
@@ -579,6 +581,121 @@ def summary_stats(records, order):
     return counts
 
 
+def combined_result_stats(records):
+    counts = {"positive": 0, "negative": 0, "not_accessed": 0}
+    for record in records:
+        bucket = result_bucket(record["primary"])
+        if bucket in counts:
+            counts[bucket] += 1
+    counts["total"] = sum(counts.values())
+    return counts
+
+
+def rounded_percentage(count, total):
+    if not total:
+        return 0
+    return int((count * 100 / total) + 0.5)
+
+
+def natural_date_list(records):
+    dates = sorted({record["visit_date"] for record in records if record["visit_date"]})
+    labels = [value.strftime("%d.%m") for value in dates]
+    if not labels:
+        return "the latest visits"
+    if len(labels) == 1:
+        return labels[0]
+    if len(labels) == 2:
+        return f"{labels[0]} and {labels[1]}"
+    return f"{', '.join(labels[:-1])} and {labels[-1]}"
+
+
+def result_label(singular, plural, count):
+    return singular if count == 1 else plural
+
+
+def build_email_content(records):
+    stats = combined_result_stats(records)
+    total = stats["total"]
+    audit_word = "audit" if total == 1 else "audits"
+    lines = [
+        (
+            result_label("Positive", "Positives", stats["positive"]),
+            stats["positive"],
+        ),
+        (
+            result_label("Negative", "Negatives", stats["negative"]),
+            stats["negative"],
+        ),
+        ("Not Accessed", stats["not_accessed"]),
+    ]
+    bullet_text = [
+        f"• {label}: {count} ({rounded_percentage(count, total)}% of {audit_word})"
+        for label, count in lines
+    ]
+    bullet_text.append(f"• Total: {total} {audit_word}")
+    intro = f"The data from {natural_date_list(records)} is in the shared drive."
+    plain_text = "\n\n".join([
+        "All,",
+        intro,
+        "The results are:",
+        "\n".join(bullet_text),
+    ])
+    html_items = "".join(
+        f"<li><strong>{escape(label)}</strong>: {count} "
+        f"({rounded_percentage(count, total)}% of {escape(audit_word)})</li>"
+        for label, count in lines
+    )
+    html_items += f"<li><strong>Total</strong>: {total} {escape(audit_word)}</li>"
+    html_text = (
+        "<div style=\"font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000\">"
+        "<p>All,</p>"
+        f"<p>{escape(intro)}</p>"
+        "<p>The results are:</p>"
+        f"<ul>{html_items}</ul>"
+        "</div>"
+    )
+    return plain_text, html_text
+
+
+def show_outlook_copy_button(plain_text, html_text):
+    plain_json = json.dumps(plain_text)
+    html_json = json.dumps(html_text)
+    components.html(
+        f"""
+        <div style="font-family:Arial,sans-serif;display:flex;align-items:center;gap:10px">
+          <button id="copy-email" style="background:#fff;border:1px solid #c9c9c9;border-radius:8px;
+            padding:8px 14px;font-weight:600;cursor:pointer">Copy formatted email for Outlook</button>
+          <span id="copy-status" style="font-size:13px;color:#555"></span>
+        </div>
+        <script>
+          const button = document.getElementById("copy-email");
+          const status = document.getElementById("copy-status");
+          button.addEventListener("click", async () => {{
+            const plainText = {plain_json};
+            const htmlText = {html_json};
+            try {{
+              if (window.ClipboardItem && navigator.clipboard.write) {{
+                const item = new window.ClipboardItem({{
+                  "text/plain": new Blob([plainText], {{type: "text/plain"}}),
+                  "text/html": new Blob([htmlText], {{type: "text/html"}}),
+                }});
+                await navigator.clipboard.write([item]);
+              }} else {{
+                await navigator.clipboard.writeText(plainText);
+              }}
+              status.textContent = "Copied — paste directly into a new Outlook email.";
+              status.style.color = "#08783e";
+            }} catch (error) {{
+              status.textContent = "Browser copy was blocked; use the copy icon below.";
+              status.style.color = "#b54708";
+            }}
+          }});
+        </script>
+        """,
+        height=55,
+    )
+
+
 def report_basename(records):
     dates = sorted({record["visit_date"] for record in records if record["visit_date"]})
     if not dates:
@@ -1122,6 +1239,14 @@ if st.button("Generate Sky LIVE report", type="primary", disabled=not ready):
                     live_name,
                     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
+                email_text, email_html = build_email_content(records)
+                st.subheader("Email text")
+                st.caption(
+                    "Use the button to copy a formatted bullet list into a new Outlook email. "
+                    "The plain-text version below also has a copy icon."
+                )
+                show_outlook_copy_button(email_text, email_html)
+                st.code(email_text, language=None)
                 with st.expander("Reference-file diagnostics"):
                     if recognised:
                         for label, fields in recognised:
