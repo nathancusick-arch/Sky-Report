@@ -500,7 +500,7 @@ def build_records(df, support, references):
             "postcode": smart_value(row["site_post_code"]),
             "submitted": parse_date(row["submitted_date"], "submitted_date"),
             "approved": parse_date(row["approval_date"], "approval_date"),
-            "approver": None,
+            "approver": smart_value(row["approved_by_name"]),
             "item": smart_value(row["item_to_order"]),
             "visit_date": parse_date(row["date_of_visit_local"], "date_of_visit_local"),
             "visit_time": parse_time(row["time_of_visit_local"]),
@@ -855,7 +855,7 @@ def total_values(record):
 
 def raw_values(record):
     return [
-        None, None, record["order"], record["client"], record["audit"], record["site"],
+        None, record["approver"], record["order"], record["client"], record["audit"], record["site"],
         record["end_date"], record["responsibility"], record["name"], record["address1"],
         record["address2"], record["address3"], record["city"], record["postcode"], record["submitted"],
         record["approved"], record["item"], record["visit_date"], record["visit_time"], None,
