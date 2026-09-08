@@ -158,6 +158,14 @@ def smart_value(value):
     return text
 
 
+def blank_zero_identifier(value):
+    """Treat source placeholder zeroes as missing identifier values."""
+    text = clean_text(value)
+    if re.fullmatch(r"0+(?:\.0+)?", text):
+        return None
+    return value
+
+
 def parse_date(value, label="date"):
     if isinstance(value, datetime):
         return value.date()
@@ -504,7 +512,7 @@ def build_records(df, support, references):
             "account_id": lookup.get("account_id"),
             "record_id": None,
             "sky_reference_number": lookup.get("sky_reference_number"),
-            "premise_id": lookup.get("premise_id"),
+            "premise_id": blank_zero_identifier(lookup.get("premise_id")),
             "pot": lookup.get("pot"),
             "questions": questions,
         }
